@@ -33,21 +33,28 @@ parser.add_argument('--automatic_entropy_tuning', type=bool, default=True, metav
                     help='Automaically adjust α (default: False)')
 parser.add_argument('--seed', type=int, default=123456, metavar='N',
                     help='random seed (default: 123456)')
-parser.add_argument('--batch_size', type=int, default=256, metavar='N',
+parser.add_argument('--batch_size', type=int, default=16, metavar='N',
                     help='batch size (default: 256)')
 parser.add_argument('--num_steps', type=int, default=1000001, metavar='N',
                     help='maximum number of steps (default: 1000000)')
 parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
                     help='hidden size (default: 256)')
-parser.add_argument('--enc_dim', type=int, default=32, metavar='N',
+parser.add_argument('--n_tasks', type=int, default=34, metavar='N',
                     help='encode size (default: 32)')
-parser.add_argument('--q_hidden_dim', type=int, default=32, metavar='N',
-                    help='q_hidden_dim (default: 64)')
+parser.add_argument('--reduction_dim', type=int, default=200, metavar='N',
+                    help='reduction_dim')
 
-parser.add_argument('--epochs', type=int, default=200, metavar='N',
+parser.add_argument('--temp', type=float, default=0.5, metavar='N',
+                    help='temp')
+parser.add_argument('--multiplier', type=float, default=1.1, metavar='N',
+                    help='multiplier')
+
+parser.add_argument('--epochs', type=int, default=100, metavar='N',
                     help='200')
 parser.add_argument('--print_interval', type=int, default=10, metavar='N',
                     help='200')
+parser.add_argument('--warm_up_epochs', type=int, default=10, metavar='N',
+                    help='10')
 
 parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
                     help='Value target update per no. of updates per step (default: 1)')
@@ -64,8 +71,8 @@ args = parser.parse_args()
 
 from dataset.calvin_dataset import CALVIN_dataset
 from torch.utils.data import DataLoader
-training_dataset = CALVIN_dataset(args.data_path)
-train_data_loader = DataLoader(dataset=training_dataset, batch_size=2)
+training_dataset = CALVIN_dataset(args.data_path,args.multiplier,args.temp,reduction_dim = args.reduction_dim)
+train_data_loader = DataLoader(dataset=training_dataset, batch_size=args.batch_size,shuffle=True)
 
 ##Environment init
 import hydra
@@ -91,11 +98,10 @@ env = calvin.Custom_Calvin_Env(sparse_reward_val=args.success_reward,**new_env_c
 #Agent
 obs_dim = train_data_loader.dataset.data[0]['robot_obs'].shape[-1]+train_data_loader.dataset.data[0]['scene_obs'].shape[-1]
 lang_dim = train_data_loader.dataset.data[0]['emb'].shape[-1]
-enc_dim = args.enc_dim
-q_hidden_dim = args.q_hidden_dim
 
-obs_dim,lang_dim,enc_dim,q_hidden_dim
-agent =off2on_sac.Off2On_SAC(obs_dim,lang_dim,enc_dim,q_hidden_dim,env.action_space,args)
+reduced_lang_embeddings = torch.tensor(training_dataset.reduced_lang_emb)
+
+agent =off2on_sac.Off2On_SAC(obs_dim,lang_dim,args.reduction_dim,reduced_lang_embeddings,env.action_space,args)
 
 #Tensorboard
 writer = SummaryWriter('logs/{}_SAC_{}_{}_{}'.format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), args.env_name,
@@ -119,17 +125,16 @@ for epoch in range(epochs):
     batch_robot_obs = episode['robot_obs'].float().to(device)
     batch_scene_obs = episode['scene_obs'].float().to(device)
     batch_actions = episode['rel_actions'].float().to(device)
-    batch_embeddings = episode['emb'].to(device)
+    task_ids = task_id.to(device)
+    #batch_embeddings = episode['emb'].to(device)
     pad = pad.to(device)
+    batch_priors = episode['prior'].float().to(device)
 
     ##Construct Reward
     reward_bool = ~pad*torch.tensor(args.success_reward)#).double()) ##[B,L]
     rewards = reward_bool[:,1:]-reward_bool[:,:-1]##[B,L-1]
-
     batch_obs = torch.cat([batch_robot_obs,batch_scene_obs],dim=-1)
-
     next_batch_obs = torch.cat([batch_robot_obs[:, 1:, :], batch_scene_obs[:, 1:, :]], dim=-1)
-
 
     ### 수정됨, offline에서는 벡터 연산 할 수 있게 수정 필요
     # batch 단위가 아니라 각 timestep마다 replay buffer에 저장
@@ -147,13 +152,21 @@ for epoch in range(epochs):
             # print(task_id_scalar)
             memory.push_with_task_id(obs, action, reward, next_obs, done, task_id_scalar)
 
-    critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.offline_update(batch_obs,batch_actions,batch_embeddings,rewards,pad)
-
+    if(epoch < args.warm_up_epochs):
+      critic_1_loss, critic_2_loss, policy_loss, ent_loss, cont_loss, prob_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_priors,updates,True)
+    else:
+      critic_1_loss, critic_2_loss, policy_loss, ent_loss, cont_loss, prob_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_priors,updates,False)
     writer.add_scalar('loss/critic_1', critic_1_loss, updates)
     writer.add_scalar('loss/critic_2', critic_2_loss, updates)
     writer.add_scalar('loss/policy', policy_loss, updates)
     writer.add_scalar('loss/entropy_loss', ent_loss, updates)
+    writer.add_scalar('loss/cont_loss', cont_loss, updates)
+    writer.add_scalar('loss/prob_loss', prob_loss, updates)
+    writer.add_scalar('loss/latent_loss', latent_loss, updates)
     writer.add_scalar('entropy_temprature/alpha', alpha, updates)
     updates += 1
-  
-  print(f"Epoch{epoch} - critic_1_loss : {critic_1_loss}, critic_2_loss : {critic_2_loss}, policy_loss : {policy_loss}, ent_loss : {ent_loss}, alpha : {alpha}")
+
+    if(updates % 10 == 0):
+      print(f"Epoch{epoch} - critic_1_loss : {critic_1_loss}, critic_2_loss : {critic_2_loss}, policy_loss : {policy_loss}, ent_loss : {ent_loss}, cont_loss : {cont_loss}, prob_loss : {prob_loss}, latent_loss : {latent_loss}alpha : {alpha}")
+
+  agent.save_checkpoint(args.env_name)

@@ -10,7 +10,7 @@ class MLP(nn.Module):
         if(hidden_dim is None):
           hidden_dim = input_dim
 
-        self.language_MLP = torch.nn.Sequential(
+        self.mlp = torch.nn.Sequential(
             torch.nn.Linear(input_dim, hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, hidden_dim),
@@ -19,7 +19,7 @@ class MLP(nn.Module):
         )
 
     def forward(self, x):
-        return self.language_MLP(x)
+        return self.mlp(x)
 
 class State2QuantizedVecEncoder(nn.Module):
     def __init__(self, state_dim, q_hidden_dim,enc_dim):  #quantized_out_dim
@@ -35,18 +35,32 @@ class State2QuantizedVecEncoder(nn.Module):
         ###quantized_vec is now a len(enc_dim) list of (B,1,hidden_dim) neural_network
         return torch.cat(quantized_vec,dim=1) # (B,enc_dim,hidden_dim) output
 
-
 class State_and_Language_Pair_Encoder(nn.Module):
-    def __init__(self, state_dim, lang_dim, enc_dim, q_hidden_dim):
+    def __init__(self, state_dim,reduced_lang_dim,reduced_lang_embeddings,temp):
         super().__init__()
-        self.language_encoder = MLP(lang_dim,q_hidden_dim)
-        self.state_quantizer = State2QuantizedVecEncoder(state_dim,q_hidden_dim,enc_dim)
+        self.N_task = 34
+        self.state_quantizer = State2QuantizedVecEncoder(state_dim,reduced_lang_dim,self.N_task)
+        self.state_dim = state_dim
+        self.reduced_lang_dim = reduced_lang_dim
+        self.register_buffer('reduced_lang_embeddings', reduced_lang_embeddings)
+        self.temp = temp
 
-    def forward(self, state, lang_instructions):
-        ##inputs state : (B,D), lang_structions : (B,L)
+    def forward(self, state, task_id):
+        ##inputs state : (B,D), task_id : (B,)
+        B,D = state.shape
+        quantized_vecs = self.state_quantizer(state)# (B,N_task,reduced_lang_dim))
+        lang_emb = self.reduced_lang_embeddings[task_id] #(B,reduced_lang_dim)
+        cos_sim = torch.cosine_similarity(quantized_vecs,lang_emb.unsqueeze(1),dim=-1) # (B,N_task)
+        
+        log_task_prob = torch.log_softmax(cos_sim/self.temp,dim=-1) # (B,N_task)
+        latent_vec = torch.einsum('ijk,ij->ik',quantized_vecs,torch.exp(log_task_prob))
+        latent_target = quantized_vecs[torch.arange(B),task_id,:].detach()
+        return latent_vec,log_task_prob,latent_target
 
-        lang_emb = self.language_encoder(lang_instructions) # (B,hidden_dim)
-        quantized_vecs = self.state_quantizer(state)# (B,enc_dim,hidden_dim)
-
-        cos_sim = torch.cosine_similarity(quantized_vecs,lang_emb.unsqueeze(1),dim=-1) # (B,enc_dim)
-        return cos_sim
+    def loss(self, state, task_id, prior,mask): # state : (B, D), prior : (B, 34)
+        B,D = state.shape
+        latent_vec, log_task_prob, latent_target = self(state,task_id) # (BL, enc_dim)
+        prior_softmax = F.log_softmax(prior, dim=-1)
+        prob_loss = F.cross_entropy(log_task_prob*mask, prior_softmax*mask,reduction='mean')
+        latent_loss = F.mse_loss(latent_vec*mask, latent_target*mask)
+        return prob_loss,latent_loss
