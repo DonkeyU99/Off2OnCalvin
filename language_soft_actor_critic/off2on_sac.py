@@ -2,7 +2,7 @@
 import os
 import torch
 import torch.nn.functional as F
-from torch.optim import Adam
+from torch.optim import Adam,SGD
 from utils import soft_update, hard_update
 from model import GaussianPolicy, QNetwork, DeterministicPolicy
 from language_encoder import State_and_Language_Pair_Encoder
@@ -25,10 +25,10 @@ class Off2On_SAC(object):
         self.state_lang_encoder = State_and_Language_Pair_Encoder(obs_dim,reduced_lang_dim,reduced_lang_embeddings,args.temp).to(self.device)
         self.state_lang_optim = Adam(self.state_lang_encoder.parameters(), lr=0.0001)
 
-        self.critic = QNetwork(reduced_lang_dim, action_space.shape[0], args.hidden_size).to(device=self.device)
-        self.critic_optim = Adam(self.critic.parameters(), lr=0.0001)
+        self.critic = QNetwork(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size).to(device=self.device)
+        self.critic_optim = SGD(self.critic.parameters(), lr=0.001)
 
-        self.critic_target = QNetwork(reduced_lang_dim, action_space.shape[0], args.hidden_size).to(self.device)
+        self.critic_target = QNetwork(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size).to(self.device)
         hard_update(self.critic_target, self.critic)
 
         if self.policy_type == "Gaussian":
@@ -38,17 +38,17 @@ class Off2On_SAC(object):
                 self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
                 self.alpha_optim = Adam([self.log_alpha], lr=0.00001)
 
-            self.policy = GaussianPolicy(reduced_lang_dim, action_space.shape[0], args.hidden_size, action_space).to(self.device)
+            self.policy = GaussianPolicy(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size, action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=0.00001)
 
         else:
             self.alpha = 0
             self.automatic_entropy_tuning = False
-            self.policy = DeterministicPolicy(reduced_lang_dim, action_space.shape[0], args.hidden_size, action_space).to(self.device)
+            self.policy = DeterministicPolicy(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size, action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
 
-    def select_action(self, state, task_id, evaluate=False):
-        latent = self.encode_latent(state, task_id)
+    def select_action(self, state, task_id,prior,evaluate=False):
+        latent = self.encode_latent(state, task_id,prior)
         #print(sstate.dtype)
         latent = latent.to(self.device)
 
@@ -73,32 +73,33 @@ class Off2On_SAC(object):
       prob_loss,latent_loss = self.state_lang_encoder.loss(latent_obs,latent_task_ids,latent_priors,latent_masks)
 
       ##Training Phase 1-2 : Representation Learning - Contrastive
-      cont_s,_,_ = self.state_lang_encoder(latent_obs,latent_task_ids) #(B*L_o,enc_dim)
+      cont_s,_,_,_ = self.state_lang_encoder(latent_obs,latent_task_ids,latent_priors) #(B*L_o,enc_dim)
       cont_s = cont_s.view(B,L_o,-1)
 
       _,_,D =cont_s.shape
 
-      t = torch.randint(L_o - 1, (B, 1, 1)).to(cont_s.device) + 1
-      cont_s_t = torch.gather(cont_s, dim=1, index=t.repeat(1, 1, D)).squeeze(1)
-      dist = (cont_s[:, 0, :].unsqueeze(1) - cont_s_t.unsqueeze(0)).pow(2).sum(-1)
+      cont_loss = torch.tensor(0.).to(cont_s.device)
 
-      log_p = F.log_softmax(-dist, dim=1)
-      weights = (self.gamma ** t).view(-1)
-      ##Intra-cluster loss
-      intra_loss = -(weights * torch.diagonal(log_p)).mean()
-      ##Inter-cluster loss
-      #inter_mask = (torch.ones_like(log_p).to(cont_s.device)-torch.eye(B).to(cont_s.device)).detach()
-      
+      for i in range(4):
+        t = torch.randint(L_o - 1, (B, 1, 1)).to(cont_s.device) + 1
+        cont_s_t = torch.gather(cont_s, dim=1, index=t.repeat(1, 1, D)).squeeze(1)
+        dist = (cont_s[:, 0, :].unsqueeze(1) - cont_s_t.unsqueeze(0)).pow(2).sum(-1)
 
+        log_p = F.log_softmax(-dist, dim=1)
+        weights = (self.gamma ** t).view(-1)
+        ##Intra-cluster loss
+        intra_loss = -(weights * torch.diagonal(log_p)*latent_masks).mean()
+        ##Inter-cluster loss
+        #inter_mask = (torch.ones_like(log_p).to(cont_s.device)-torch.eye(B).to(cont_s.device)).detach()
+        cont_loss += intra_loss
       #inter_loss = inter_mask
       ##Language Contrastive?
-      cont_loss = intra_loss
 
       prob_coef = 1.
-      latent_coef = 0.1
+      latent_coef = 20.
       
       rep_loss = cont_loss + prob_coef*prob_loss + latent_coef*latent_loss
-
+      #if(warm_up):
       self.state_lang_optim.zero_grad()
       rep_loss.backward()#retain_graph=True)
       #clip_grad_norm_(self.state_lang_encoder.parameters(), max_norm=1.0)
@@ -108,12 +109,14 @@ class Off2On_SAC(object):
         B,L = reward.shape #여기서 L 은 L-1
         curr_obs = observations[:,:-1,:].reshape(B*L,-1) #(B*L,state_dim)
         curr_task_id = task_ids.repeat(1,L).flatten() #(B*L,)
+        curr_priors = prior[:,:-1,:].reshape(B*L,-1)
         curr_action = actions[:,:-1,:].reshape(B*L,-1) #(B*L,action_dim)
         next_obs = observations[:,1:,:].reshape(B*L,-1) #(B*L,state_dim)
+        next_priors = prior[:,1:,:].reshape(B*L,-1)
         next_task_id = task_ids.repeat(1,L).flatten() #(B*L,)
 
-        curr_actor_in,_,_ = self.state_lang_encoder(curr_obs,curr_task_id) #(B*L,enc_dim)
-        next_actor_in,_,_ = self.state_lang_encoder(next_obs,next_task_id)#(B*L,enc_dim)
+        curr_actor_in,_,_,_ = self.state_lang_encoder(curr_obs,curr_task_id,curr_priors) #(B*L,enc_dim)
+        next_actor_in,_,_,_ = self.state_lang_encoder(next_obs,next_task_id,next_priors)#(B*L,enc_dim)
         curr_actor_in = curr_actor_in.detach()
         next_actor_in = next_actor_in.detach()
         with torch.no_grad():
@@ -141,9 +144,7 @@ class Off2On_SAC(object):
 
         self.policy_optim.zero_grad()
         policy_loss.backward()#retain_graph=True)
-        clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
         self.policy_optim.step()
-
 
         if self.automatic_entropy_tuning:
             alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
@@ -165,13 +166,13 @@ class Off2On_SAC(object):
 
       return 0.,0.,0.,0., cont_loss.item(),prob_loss.item(),latent_loss.item(),0.
    
-    def encode_latent(self, state, task_id):
+    def encode_latent(self, state, task_id,latent_prior):
         state = torch.FloatTensor(np.concatenate([state['robot_obs'],state['scene_obs']])).unsqueeze(0).to(device = self.device)
         #state2 = torch.FloatTensor(state['scene_obs']).to(device = self.device)
         # print(lang_emb.shape)
         #state = torch.cat((state1, state2)).unsqueeze(0)
-        latent_state,_,_ = self.state_lang_encoder(state,torch.tensor(task_id))
-        return latent_state
+        rep_state,_,_,_ = self.state_lang_encoder(state,torch.tensor(task_id),latent_prior.to(device = self.device))
+        return rep_state
 
     def online_update(self, lang, memory, batch_size, updates):
         # Sample a batch from memory

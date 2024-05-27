@@ -37,14 +37,14 @@ parser.add_argument('--batch_size', type=int, default=16, metavar='N',
                     help='batch size (default: 256)')
 parser.add_argument('--num_steps', type=int, default=1000001, metavar='N',
                     help='maximum number of steps (default: 1000000)')
-parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
+parser.add_argument('--hidden_size', type=int, default=1024, metavar='N',
                     help='hidden size (default: 256)')
 parser.add_argument('--n_tasks', type=int, default=34, metavar='N',
                     help='encode size (default: 32)')
 parser.add_argument('--reduction_dim', type=int, default=200, metavar='N',
                     help='reduction_dim')
 
-parser.add_argument('--temp', type=float, default=0.5, metavar='N',
+parser.add_argument('--temp', type=float, default=0.01, metavar='N',
                     help='temp')
             
 parser.add_argument('--multiplier', type=float, default=1.1, metavar='N',
