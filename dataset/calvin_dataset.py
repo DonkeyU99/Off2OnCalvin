@@ -114,8 +114,8 @@ class CALVIN_dataset(Dataset):
         embeddings_gen = [model.encode(i) for i in sentences]
         X_train_raw = np.asarray(embeddings_org + embeddings_gen)
 
-        if self.reduction_dim < X_train_raw.shape[1]/2:
-            print("reduced dim should be larger than #datasets/2. It may hurt representation performances")
+        #if self.reduction_dim < X_train_raw.shape[1]/2:
+        #    print("reduced dim should be larger than #datasets/2. It may hurt representation performances")
         pca = PCA(n_components= 384)
         X_train = X_train_raw - np.mean(X_train_raw)
         X_fit = pca.fit_transform(X_train)

@@ -22,9 +22,13 @@ class MLP(nn.Module):
         return self.mlp(x)
 
 class State2QuantizedVecEncoder(nn.Module):
-    def __init__(self, state_dim, q_hidden_dim,enc_dim):  #quantized_out_dim
+    def __init__(self, state_dim, q_hidden_dim,enc_dim,linear=True):  #quantized_out_dim
         super().__init__()
-        self.quantized_layer = nn.ModuleList(MLP(state_dim,q_hidden_dim,hidden_dim=384) for i in range(enc_dim))
+        if(linear):
+          self.quantized_layer = nn.ModuleList(nn.Linear(state_dim,q_hidden_dim) for i in range(enc_dim))
+        else:
+          self.quantized_layer = nn.ModuleList(MLP(state_dim,q_hidden_dim,hidden_dim=16) for i in range(enc_dim))
+        
 
     def forward(self, x):
         B,D = x.size()
