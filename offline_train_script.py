@@ -24,7 +24,7 @@ parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
                     help='discount factor for reward (default: 0.99)')
 parser.add_argument('--tau', type=float, default=0.005, metavar='G',
                     help='target smoothing coefficient(τ) (default: 0.005)')
-parser.add_argument('--lr', type=float, default=0.0003, metavar='G',
+parser.add_argument('--lr', type=float, default=0.00001, metavar='G',
                     help='learning rate (default: 0.0003)')
 parser.add_argument('--alpha', type=float, default=0.2, metavar='G',
                     help='Temperature parameter α determines the relative importance of the entropy\
@@ -46,6 +46,7 @@ parser.add_argument('--reduction_dim', type=int, default=200, metavar='N',
 
 parser.add_argument('--temp', type=float, default=0.5, metavar='N',
                     help='temp')
+            
 parser.add_argument('--multiplier', type=float, default=1.1, metavar='N',
                     help='multiplier')
 
@@ -53,7 +54,7 @@ parser.add_argument('--epochs', type=int, default=100, metavar='N',
                     help='200')
 parser.add_argument('--print_interval', type=int, default=10, metavar='N',
                     help='200')
-parser.add_argument('--warm_up_epochs', type=int, default=10, metavar='N',
+parser.add_argument('--warm_up_epochs', type=int, default=5, metavar='N',
                     help='10')
 
 parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
