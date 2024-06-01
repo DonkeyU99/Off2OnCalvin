@@ -6,7 +6,7 @@ import csv
 
 
 class CALVIN_dataset(Dataset):
-    def __init__(self, data_path, multiplier=1.1,temp=0.5,max_len = 64, min_len = 4,pad = True,
+    def __init__(self, data_path, multiplier=1.4,temp=0.5,max_len = 64, min_len = 4,pad = True,
     reduction_dim = 200,
     lang_emb_path='/content/drive/MyDrive/calvinoffon/calvin_env/dataset/calvin_debug_dataset/validation/lang_annotations/embeddings.npy'):
         self.data = np.load(data_path, allow_pickle=True)['arr_0']
@@ -29,6 +29,7 @@ class CALVIN_dataset(Dataset):
 
 
         self.language_reduction(lang_path=lang_emb_path)
+        self.make_goals()
 
         ### Make Prior
         self.multiplier = multiplier
@@ -75,6 +76,12 @@ class CALVIN_dataset(Dataset):
         pad_vector = np.zeros(self.max_len,dtype=bool)
         pad_vector[:traj_len] = True
         return trajectory,pad_vector
+
+    def make_goals(self):
+        for trajectory in self.data:
+          trajectory['robot_obs_g'] = trajectory['robot_obs'][-1,:]
+          trajectory['scene_obs_g'] = trajectory['scene_obs'][-1,:]
+
 
     def make_task_prob_prior(self):
         for idx,data in enumerate(self.data):

@@ -20,7 +20,7 @@ parser.add_argument('--env-name', default="calvin",
 
 parser.add_argument('--policy', default="Gaussian",
                     help='Policy Type: Gaussian | Deterministic (default: Gaussian)')
-parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
+parser.add_argument('--gamma', type=float, default=0.95, metavar='G',
                     help='discount factor for reward (default: 0.99)')
 parser.add_argument('--tau', type=float, default=0.005, metavar='G',
                     help='target smoothing coefficient(τ) (default: 0.005)')
@@ -37,11 +37,13 @@ parser.add_argument('--batch_size', type=int, default=16, metavar='N',
                     help='batch size (default: 256)')
 parser.add_argument('--num_steps', type=int, default=1000001, metavar='N',
                     help='maximum number of steps (default: 1000000)')
-parser.add_argument('--hidden_size', type=int, default=1024, metavar='N',
+parser.add_argument('--hidden_size', type=int, default=512, metavar='N',
                     help='hidden size (default: 256)')
 parser.add_argument('--n_tasks', type=int, default=34, metavar='N',
                     help='encode size (default: 32)')
 parser.add_argument('--reduction_dim', type=int, default=200, metavar='N',
+                    help='reduction_dim')
+parser.add_argument('--out_dim', type=int, default=64, metavar='N',
                     help='reduction_dim')
 
 parser.add_argument('--temp', type=float, default=0.01, metavar='N',
@@ -102,7 +104,7 @@ lang_dim = train_data_loader.dataset.data[0]['emb'].shape[-1]
 
 reduced_lang_embeddings = torch.tensor(training_dataset.reduced_lang_emb)
 
-agent =off2on_sac.Off2On_SAC(obs_dim,lang_dim,args.reduction_dim,reduced_lang_embeddings,env.action_space,args)
+agent =off2on_sac.Off2On_SAC(obs_dim,args.out_dim,args.reduction_dim,reduced_lang_embeddings,env.action_space,args)
 
 #Tensorboard
 writer = SummaryWriter('logs/{}_SAC_{}_{}_{}'.format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), args.env_name,
@@ -129,13 +131,22 @@ for epoch in range(epochs):
     task_ids = task_id.to(device)
     #batch_embeddings = episode['emb'].to(device)
     pad = pad.to(device)
-    batch_priors = episode['prior'].float().to(device)
+    batch_r_goals= episode['robot_obs_g'].float().to(device)
+    batch_s_goals= episode['scene_obs_g'].float().to(device)
 
     ##Construct Reward
-    reward_bool = ~pad*torch.tensor(args.success_reward)#).double()) ##[B,L]
+    reward_bool = ~pad*torch.tensor(args.success_reward)*2.5#).double()) ##[B,L]
+    idx_1 = torch.arange(args.batch_size).reshape(args.batch_size,1)
+    idx_2 = -torch.sum(~pad, dim=1,keepdim=True)
+    
+    reward_bool[idx_1, idx_2-1] = 1.5
+    reward_bool[idx_1, idx_2-2] = 0.75
+    reward_bool[idx_1, idx_2-3] = 0.25
+    
     rewards = reward_bool[:,1:]-reward_bool[:,:-1]##[B,L-1]
     batch_obs = torch.cat([batch_robot_obs,batch_scene_obs],dim=-1)
     next_batch_obs = torch.cat([batch_robot_obs[:, 1:, :], batch_scene_obs[:, 1:, :]], dim=-1)
+    batch_goals = torch.cat([batch_r_goals,batch_s_goals],dim=-1)
 
     ### 수정됨, offline에서는 벡터 연산 할 수 있게 수정 필요
     # batch 단위가 아니라 각 timestep마다 replay buffer에 저장
@@ -152,22 +163,20 @@ for epoch in range(epochs):
             training_dataset.get_task_name(task_id_scalar)
             # print(task_id_scalar)
             memory.push_with_task_id(obs, action, reward, next_obs, done, task_id_scalar)
-
-    if(epoch < args.warm_up_epochs):
-      critic_1_loss, critic_2_loss, policy_loss, ent_loss, cont_loss, prob_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_priors,updates,True)
+            
+    if(epochs < args.warm_up_epochs):
+      critic_1_loss, critic_2_loss, policy_loss, ent_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_goals,updates,True)
     else:
-      critic_1_loss, critic_2_loss, policy_loss, ent_loss, cont_loss, prob_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_priors,updates,False)
+      critic_1_loss, critic_2_loss, policy_loss, ent_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_goals,updates,False)
     writer.add_scalar('loss/critic_1', critic_1_loss, updates)
     writer.add_scalar('loss/critic_2', critic_2_loss, updates)
     writer.add_scalar('loss/policy', policy_loss, updates)
     writer.add_scalar('loss/entropy_loss', ent_loss, updates)
-    writer.add_scalar('loss/cont_loss', cont_loss, updates)
-    writer.add_scalar('loss/prob_loss', prob_loss, updates)
     writer.add_scalar('loss/latent_loss', latent_loss, updates)
     writer.add_scalar('entropy_temprature/alpha', alpha, updates)
     updates += 1
 
     if(updates % 10 == 0):
-      print(f"Epoch{epoch} - critic_1_loss : {critic_1_loss}, critic_2_loss : {critic_2_loss}, policy_loss : {policy_loss}, ent_loss : {ent_loss}, cont_loss : {cont_loss}, prob_loss : {prob_loss}, latent_loss : {latent_loss}alpha : {alpha}")
+      print(f"Epoch{epoch} - critic_1_loss : {critic_1_loss}, critic_2_loss : {critic_2_loss}, policy_loss : {policy_loss}, ent_loss : {ent_loss},latent_loss : {latent_loss}alpha : {alpha}")
 
   agent.save_checkpoint(args.env_name)

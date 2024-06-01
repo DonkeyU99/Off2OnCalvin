@@ -5,12 +5,12 @@ import torch.nn.functional as F
 from torch.optim import Adam,SGD
 from utils import soft_update, hard_update
 from model import GaussianPolicy, QNetwork, DeterministicPolicy
-from language_encoder import State_and_Language_Pair_Encoder
+from language_encoder import GoalConditioned_StateEncoder
 import numpy as np
 from torch.nn.utils import clip_grad_norm_
 
 class Off2On_SAC(object):
-    def __init__(self, obs_dim,lang_dim,reduced_lang_dim,reduced_lang_embeddings,action_space,args):
+    def __init__(self, obs_dim,out_dim,reduced_lang_dim,reduced_lang_embdeddings,action_space,args):
 
         self.gamma = args.gamma
         self.tau = args.tau
@@ -22,13 +22,13 @@ class Off2On_SAC(object):
 
         self.device = torch.device("cuda" if args.cuda else "cpu")
 
-        self.state_lang_encoder = State_and_Language_Pair_Encoder(obs_dim,reduced_lang_dim,reduced_lang_embeddings,args.temp).to(self.device)
-        self.state_lang_optim = Adam(self.state_lang_encoder.parameters(), lr=0.0001)
+        self.sg_encoder =GoalConditioned_StateEncoder(obs_dim,out_dim,tau=self.tau).to(self.device)
+        self.sg_enc_optim = Adam(self.sg_encoder.parameters(), lr=0.0001)
 
-        self.critic = QNetwork(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size).to(device=self.device)
-        self.critic_optim = SGD(self.critic.parameters(), lr=0.001)
+        self.critic = QNetwork(obs_dim, action_space.shape[0], args.hidden_size).to(device=self.device)
+        self.critic_optim = Adam(self.critic.parameters(), lr=0.0001)
 
-        self.critic_target = QNetwork(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size).to(self.device)
+        self.critic_target = QNetwork(obs_dim, action_space.shape[0], args.hidden_size).to(self.device)
         hard_update(self.critic_target, self.critic)
 
         if self.policy_type == "Gaussian":
@@ -36,96 +36,68 @@ class Off2On_SAC(object):
             if self.automatic_entropy_tuning is True:
                 self.target_entropy = -torch.prod(torch.Tensor(action_space.shape).to(self.device)).item()
                 self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-                self.alpha_optim = Adam([self.log_alpha], lr=0.00001)
+                self.alpha_optim = Adam([self.log_alpha], lr=0.0001)
 
-            self.policy = GaussianPolicy(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size, action_space).to(self.device)
+            self.policy = GaussianPolicy(obs_dim, out_dim,action_space.shape[0],out_dim,args.hidden_size,reduced_lang_dim,reduced_lang_embdeddings,action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=0.00001)
 
         else:
             self.alpha = 0
             self.automatic_entropy_tuning = False
-            self.policy = DeterministicPolicy(obs_dim+reduced_lang_dim, action_space.shape[0], args.hidden_size, action_space).to(self.device)
-            self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
+            self.policy = DeterministicPolicy(obs_dim, action_space.shape[0],out_dim,args.hidden_size,reduced_lang_dim,reduced_lang_embdeddings, action_space).to(self.device)
+            self.policy_optim = Adam(self.policy.parameters(), lr=0.00001)
 
-    def select_action(self, state, task_id,prior,evaluate=False):
-        latent = self.encode_latent(state, task_id,prior)
+    def select_action(self, state,task_id,evaluate=False):
+        state = state.to(self.device)
         #print(sstate.dtype)
-        latent = latent.to(self.device)
+        task_id = task_id.to(self.device)
 
         if evaluate is False:
-            action, _, _ = self.policy.sample(latent)
+            action, _, _ = self.policy.sample(state,task_id)
         else:
-            _, _, action = self.policy.sample(latent)
+            _, _, action = self.policy.sample(state,task_id)
         return action.detach().cpu().numpy()[0]
 
-    def offline_update(self,observations,actions,task_ids,reward,mask,prior,updates,warm_up=True):
+    def offline_update(self,observations,actions,task_ids,reward,mask,goals,updates,warm_up=True):
       #observations.shape = (B,L,obs_dim)
       #actions.shape = (B,L,action_shape)
       #task_ids = (B,1)
       B,L_o,_ = observations.shape
       latent_obs = observations.reshape(B*L_o,-1) #(B*L_o,state_dim)
-      latent_task_ids = task_ids.repeat(1,L_o).flatten()
-      latent_priors = prior.reshape(B*L_o,-1)
+      latent_goals = goals.reshape(B,-1)
       latent_masks = mask.reshape(B*L_o,-1)
 
       ##Training Phase 1-1 : Representation Learning - Latent
       #latent_lang = lang.repeat(1,L_o,1).reshape(B*L_o,-1)#(B*L_o,lang_dim)
-      prob_loss,latent_loss = self.state_lang_encoder.loss(latent_obs,latent_task_ids,latent_priors,latent_masks)
+      latent_loss = self.sg_encoder.loss(latent_obs,latent_goals,L_o,self.gamma,latent_masks)
 
-      ##Training Phase 1-2 : Representation Learning - Contrastive
-      cont_s,_,_,_ = self.state_lang_encoder(latent_obs,latent_task_ids,latent_priors) #(B*L_o,enc_dim)
-      cont_s = cont_s.view(B,L_o,-1)
-
-      _,_,D =cont_s.shape
-
-      cont_loss = torch.tensor(0.).to(cont_s.device)
-
-      for i in range(4):
-        t = torch.randint(L_o - 1, (B, 1, 1)).to(cont_s.device) + 1
-        cont_s_t = torch.gather(cont_s, dim=1, index=t.repeat(1, 1, D)).squeeze(1)
-        dist = (cont_s[:, 0, :].unsqueeze(1) - cont_s_t.unsqueeze(0)).pow(2).sum(-1)
-
-        log_p = F.log_softmax(-dist, dim=1)
-        weights = (self.gamma ** t).view(-1)
-        ##Intra-cluster loss
-        intra_loss = -(weights * torch.diagonal(log_p)*latent_masks).mean()
-        ##Inter-cluster loss
-        #inter_mask = (torch.ones_like(log_p).to(cont_s.device)-torch.eye(B).to(cont_s.device)).detach()
-        cont_loss += intra_loss
-      #inter_loss = inter_mask
-      ##Language Contrastive?
-
-      prob_coef = 1.
-      latent_coef = 20.
-      
-      rep_loss = cont_loss + prob_coef*prob_loss + latent_coef*latent_loss
-      #if(warm_up):
-      self.state_lang_optim.zero_grad()
-      rep_loss.backward()#retain_graph=True)
-      #clip_grad_norm_(self.state_lang_encoder.parameters(), max_norm=1.0)
-      self.state_lang_optim.step()
+      self.sg_enc_optim.zero_grad()
+      latent_loss.backward()#retain_graph=True)
+      self.sg_enc_optim.step()
 
       if(warm_up==False):
         B,L = reward.shape #여기서 L 은 L-1
         curr_obs = observations[:,:-1,:].reshape(B*L,-1) #(B*L,state_dim)
-        curr_task_id = task_ids.repeat(1,L).flatten() #(B*L,)
-        curr_priors = prior[:,:-1,:].reshape(B*L,-1)
         curr_action = actions[:,:-1,:].reshape(B*L,-1) #(B*L,action_dim)
-        next_obs = observations[:,1:,:].reshape(B*L,-1) #(B*L,state_dim)
-        next_priors = prior[:,1:,:].reshape(B*L,-1)
-        next_task_id = task_ids.repeat(1,L).flatten() #(B*L,)
+        curr_goals = goals.reshape(B,-1)
+        curr_task_id = task_ids.repeat(1,L).flatten()
 
-        curr_actor_in,_,_,_ = self.state_lang_encoder(curr_obs,curr_task_id,curr_priors) #(B*L,enc_dim)
-        next_actor_in,_,_,_ = self.state_lang_encoder(next_obs,next_task_id,next_priors)#(B*L,enc_dim)
+        next_obs = observations[:,1:,:].reshape(B*L,-1) #(B*L,state_dim)
+        next_action = actions[:,1:,:].reshape(B*L,-1) #(B*L,action_dim)
+        next_goals = goals.reshape(B,-1)
+        next_task_id = task_ids.repeat(1,L).flatten()
+
+        curr_actor_in,_,curr_goal_in= self.sg_encoder(curr_obs,curr_goals) #(B*L,enc_dim)
+        next_actor_in,_,next_goal_in = self.sg_encoder(next_obs,next_goals)#(B*L,enc_dim)
         curr_actor_in = curr_actor_in.detach()
         next_actor_in = next_actor_in.detach()
         with torch.no_grad():
-          next_state_action, next_state_log_pi, _ = self.policy.sample(next_actor_in)
-          qf1_next_target, qf2_next_target = self.critic_target(next_actor_in, next_state_action)
+          next_state_action, next_state_log_pi, _ = self.policy.sample(next_obs,next_task_id)
+          qf1_next_target, qf2_next_target = self.critic_target(next_obs, next_state_action)
           min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
           next_q_value = reward.reshape(B*L,-1) + mask[:,:-1].reshape(B*L,-1) * self.gamma * (min_qf_next_target)
 
-        qf1, qf2 = self.critic(curr_actor_in, curr_action)# Two Q-functions to mitigate positive bias in the policy improvement step
+        qf1, qf2 = self.critic(curr_obs, curr_action)# Two Q-functions to mitigate positive bias in the policy improvement step
         qf1_loss = F.mse_loss(qf1, next_q_value)  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
         qf2_loss = F.mse_loss(qf2, next_q_value)  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
         qf_loss = qf1_loss + qf2_loss
@@ -135,8 +107,8 @@ class Off2On_SAC(object):
         self.critic_optim.step()
         #clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
 
-        pi, log_pi, _ = self.policy.sample(curr_actor_in)
-        qf1_pi, qf2_pi = self.critic(curr_actor_in,pi)
+        pi, log_pi, _ = self.policy.sample(curr_obs,curr_task_id)
+        qf1_pi, qf2_pi = self.critic(curr_obs,pi)
         min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
         policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean() # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
@@ -162,9 +134,9 @@ class Off2On_SAC(object):
         if updates % self.target_update_interval == 0:
             soft_update(self.critic_target, self.critic, self.tau)
 
-        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(), cont_loss.item(),prob_loss.item(),latent_loss.item(),alpha_tlogs.item()
+        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(),latent_loss.item(),alpha_tlogs.item()
 
-      return 0.,0.,0.,0., cont_loss.item(),prob_loss.item(),latent_loss.item(),0.
+      return 0.,0.,0.,0.,latent_loss.item(),0.
    
     def encode_latent(self, state, task_id,latent_prior):
         state = torch.FloatTensor(np.concatenate([state['robot_obs'],state['scene_obs']])).unsqueeze(0).to(device = self.device)
@@ -250,11 +222,12 @@ class Off2On_SAC(object):
         if ckpt_path is None:
             ckpt_path = "checkpoints/sac_checkpoint_{}_{}".format(env_name, suffix)
         print('Saving models to {}'.format(ckpt_path))
-        torch.save({'encoder_state_dict': self.state_lang_encoder.state_dict(),
+        torch.save({'encoder_state_dict': self.sg_encoder.state_dict(),
                     'policy_state_dict': self.policy.state_dict(),
                     'critic_state_dict': self.critic.state_dict(),
                     'critic_target_state_dict': self.critic_target.state_dict(),
                     'critic_optimizer_state_dict': self.critic_optim.state_dict(),
+
                     'policy_optimizer_state_dict': self.policy_optim.state_dict()}, ckpt_path)
 
     # Load model parameters
@@ -262,7 +235,7 @@ class Off2On_SAC(object):
         print('Loading models from {}'.format(ckpt_path))
         if ckpt_path is not None:
             checkpoint = torch.load(ckpt_path)
-            self.state_lang_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            self.sg_encoder.load_state_dict(checkpoint['encoder_state_dict'])
             self.policy.load_state_dict(checkpoint['policy_state_dict'])
             self.critic.load_state_dict(checkpoint['critic_state_dict'])
             self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
