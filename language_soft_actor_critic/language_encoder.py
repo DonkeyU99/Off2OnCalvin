@@ -22,11 +22,12 @@ class MLP(nn.Module):
         return self.mlp(x)
 
 class GoalConditioned_StateEncoder(nn.Module):
-  def __init__(self, state_dim,output_dim,tau=0.3,hidden_dim=256,identity=True):
+  def __init__(self, state_dim,output_dim,tau=0.3,hidden_dim=256,identity=True):  # state_dim = 15 + 24 = 39 / output_dim = 64 (arg에서 수정)
     super().__init__()
     self.identity = identity
     if(identity):
         self.encoder = nn.Identity()
+
     else:
       self.encoder = MLP(state_dim,output_dim,hidden_dim)
       self.decoder = MLP(output_dim,state_dim,hidden_dim)
@@ -37,8 +38,8 @@ class GoalConditioned_StateEncoder(nn.Module):
     ## x : (B,L,D)였던 벡터가 ((B*L,D)로 바뀌어서 들어옴)
     ## goal : (B,D)
     if(self.identity):
-      x_enc = self.encoder(x)
-      g_enc = self.encoder(goal)
+      x_enc = self.encoder(x)  # (B*L, state_dim)
+      g_enc = self.encoder(goal) # (B, state_dim)
       x_recon = None
   
     else:

@@ -8,6 +8,7 @@ from model import GaussianPolicy, QNetwork, DeterministicPolicy
 from language_encoder import GoalConditioned_StateEncoder
 import numpy as np
 from torch.nn.utils import clip_grad_norm_
+from utils import CosineAnnealingWarmUpRestarts
 
 class Off2On_SAC(object):
     def __init__(self, obs_dim,out_dim,reduced_lang_dim,reduced_lang_embdeddings,action_space,args):
@@ -22,13 +23,16 @@ class Off2On_SAC(object):
 
         self.device = torch.device("cuda" if args.cuda else "cpu")
 
-        self.sg_encoder =GoalConditioned_StateEncoder(obs_dim,out_dim,tau=self.tau).to(self.device)
-        self.sg_enc_optim = Adam(self.sg_encoder.parameters(), lr=0.0001)
+        self.sg_encoder =GoalConditioned_StateEncoder(obs_dim,out_dim,tau=self.tau,identity=True).to(self.device) # If identity=True -> encoder = nn.Identity / obs_dim = scene_obs + robot_obs
+        # self.sg_enc_optim = Adam(self.sg_encoder.parameters(), lr=0.0001)
 
-        self.critic = QNetwork(obs_dim, action_space.shape[0], args.hidden_size).to(device=self.device)
+        #enc_obs_dim = self.sg_encoder.output_dim + obs_dim
+        enc_obs_dim = obs_dim
+
+        self.critic = QNetwork(enc_obs_dim, action_space.shape[0], args.hidden_size).to(device=self.device)
         self.critic_optim = Adam(self.critic.parameters(), lr=0.0001)
 
-        self.critic_target = QNetwork(obs_dim, action_space.shape[0], args.hidden_size).to(self.device)
+        self.critic_target = QNetwork(enc_obs_dim, action_space.shape[0], args.hidden_size).to(self.device)
         hard_update(self.critic_target, self.critic)
 
         if self.policy_type == "Gaussian":
@@ -38,24 +42,27 @@ class Off2On_SAC(object):
                 self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
                 self.alpha_optim = Adam([self.log_alpha], lr=0.0001)
 
-            self.policy = GaussianPolicy(obs_dim, out_dim,action_space.shape[0],out_dim,args.hidden_size,reduced_lang_dim,reduced_lang_embdeddings,action_space).to(self.device)
+            self.policy = GaussianPolicy(enc_obs_dim, action_space.shape[0],args.hidden_size,reduced_lang_dim,reduced_lang_embdeddings,action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=0.00001)
 
         else:
             self.alpha = 0
             self.automatic_entropy_tuning = False
-            self.policy = DeterministicPolicy(obs_dim, action_space.shape[0],out_dim,args.hidden_size,reduced_lang_dim,reduced_lang_embdeddings, action_space).to(self.device)
+            self.policy = DeterministicPolicy(enc_obs_dim, action_space.shape[0],args.hidden_size,reduced_lang_dim,reduced_lang_embdeddings, action_space).to(self.device) #,out_dim
             self.policy_optim = Adam(self.policy.parameters(), lr=0.00001)
 
-    def select_action(self, state,task_id,evaluate=False):
-        state = state.to(self.device)
+        self.policy_scheduler = CosineAnnealingWarmUpRestarts(self.policy_optim, T_0=8, T_mult=1, eta_max=0.00005, T_up=2, gamma=0.5)
+        self.critic_scheduler = CosineAnnealingWarmUpRestarts(self.critic_optim, T_0=8, T_mult=1, eta_max=0.00005, T_up=2, gamma=0.5)
+
+    def select_action(self, enc_state,task_id,evaluate=False):
+        enc_state = enc_state.to(self.device)
         #print(sstate.dtype)
         task_id = task_id.to(self.device)
 
         if evaluate is False:
-            action, _, _ = self.policy.sample(state,task_id)
+            action, _, _ = self.policy.sample(enc_state,task_id)
         else:
-            _, _, action = self.policy.sample(state,task_id)
+            _, _, action = self.policy.sample(enc_state,task_id)
         return action.detach().cpu().numpy()[0]
 
     def offline_update(self,observations,actions,task_ids,reward,mask,goals,updates,warm_up=True):
@@ -69,17 +76,17 @@ class Off2On_SAC(object):
 
       ##Training Phase 1-1 : Representation Learning - Latent
       #latent_lang = lang.repeat(1,L_o,1).reshape(B*L_o,-1)#(B*L_o,lang_dim)
-      latent_loss = self.sg_encoder.loss(latent_obs,latent_goals,L_o,self.gamma,latent_masks)
+    #   latent_loss = self.sg_encoder.loss(latent_obs,latent_goals,L_o,self.gamma,latent_masks)
 
-      self.sg_enc_optim.zero_grad()
-      latent_loss.backward()#retain_graph=True)
-      self.sg_enc_optim.step()
+    #   self.sg_enc_optim.zero_grad()
+    #   latent_loss.backward()#retain_graph=True)
+    #   self.sg_enc_optim.step()
 
       if(warm_up==False):
         B,L = reward.shape #여기서 L 은 L-1
         curr_obs = observations[:,:-1,:].reshape(B*L,-1) #(B*L,state_dim)
         curr_action = actions[:,:-1,:].reshape(B*L,-1) #(B*L,action_dim)
-        curr_goals = goals.reshape(B,-1)
+        curr_goals = goals.reshape(B,-1)  #(B, 39)
         curr_task_id = task_ids.repeat(1,L).flatten()
 
         next_obs = observations[:,1:,:].reshape(B*L,-1) #(B*L,state_dim)
@@ -87,12 +94,16 @@ class Off2On_SAC(object):
         next_goals = goals.reshape(B,-1)
         next_task_id = task_ids.repeat(1,L).flatten()
 
-        curr_actor_in,_,curr_goal_in= self.sg_encoder(curr_obs,curr_goals) #(B*L,enc_dim)
-        next_actor_in,_,next_goal_in = self.sg_encoder(next_obs,next_goals)#(B*L,enc_dim)
-        curr_actor_in = curr_actor_in.detach()
-        next_actor_in = next_actor_in.detach()
+        # curr_actor_in,curr_goal_in,_= self.sg_encoder(curr_obs,curr_goals) #(B*L,enc_dim)
+        # next_actor_in,next_goal_in,_ = self.sg_encoder(next_obs,next_goals)#(B*L,enc_dim)
+        # curr_actor_in = curr_actor_in.detach()
+        # next_actor_in = next_actor_in.detach()
+
+        # curr_actor_in = torch.cat([curr_obs, curr_actor_in], dim=-1).detach()   #(B*L + B, 39)
+        # next_actor_in = torch.cat([next_obs, next_actor_in], dim=-1).detach()
+
         with torch.no_grad():
-          next_state_action, next_state_log_pi, _ = self.policy.sample(next_obs,next_task_id)
+          next_state_action, next_state_log_pi, _ = self.policy.sample(next_obs, next_task_id)
           qf1_next_target, qf2_next_target = self.critic_target(next_obs, next_state_action)
           min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
           next_q_value = reward.reshape(B*L,-1) + mask[:,:-1].reshape(B*L,-1) * self.gamma * (min_qf_next_target)
@@ -105,7 +116,7 @@ class Off2On_SAC(object):
         self.critic_optim.zero_grad()
         qf_loss.backward()#retain_graph=True)
         self.critic_optim.step()
-        #clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+        # clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
 
         pi, log_pi, _ = self.policy.sample(curr_obs,curr_task_id)
         qf1_pi, qf2_pi = self.critic(curr_obs,pi)
@@ -133,8 +144,9 @@ class Off2On_SAC(object):
     
         if updates % self.target_update_interval == 0:
             soft_update(self.critic_target, self.critic, self.tau)
+            
 
-        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(),latent_loss.item(),alpha_tlogs.item()
+        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(),0, alpha_tlogs.item()
 
       return 0.,0.,0.,0.,latent_loss.item(),0.
    
