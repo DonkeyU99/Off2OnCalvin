@@ -75,7 +75,7 @@ args = parser.parse_args()
 from dataset.calvin_dataset import CALVIN_dataset
 from torch.utils.data import DataLoader
 training_dataset = CALVIN_dataset(args.data_path,args.multiplier,args.temp,reduction_dim = args.reduction_dim)
-train_data_loader = DataLoader(dataset=training_dataset, batch_size=args.batch_size,shuffle=True)
+train_data_loader = DataLoader(dataset=training_dataset, batch_size=args.batch_size,shuffle=True, drop_last=True)
 
 ##Environment init
 import hydra
@@ -90,7 +90,7 @@ with initialize(config_path="./calvin_env/conf/"):
   print(cfg.env)
 
 
-import custom_calvin_env as calvin#import Custom_Calvin_Env
+import custom_calvin_env as calvin #import Custom_Calvin_Env
 
 new_env_cfg = {**cfg.env}
 new_env_cfg["tasks"] = cfg.tasks
@@ -131,8 +131,11 @@ for epoch in range(epochs):
     task_ids = task_id.to(device)
     #batch_embeddings = episode['emb'].to(device)
     pad = pad.to(device)
-    batch_r_goals= episode['robot_obs_g'].float().to(device)
-    batch_s_goals= episode['scene_obs_g'].float().to(device)
+    # batch_r_goals= episode['robot_obs_g'].float().to(device)
+    # batch_s_goals= episode['scene_obs_g'].float().to(device)
+    batch_r_goals = episode['robot_obs'][:,-1,:].reshape(-1,15).to(device)
+    batch_s_goals = episode['scene_obs'][:,-1,:].reshape(-1,24).to(device)
+
 
     ##Construct Reward
     reward_bool = ~pad*torch.tensor(args.success_reward)*2.5#).double()) ##[B,L]
@@ -140,8 +143,8 @@ for epoch in range(epochs):
     idx_2 = -torch.sum(~pad, dim=1,keepdim=True)
     
     reward_bool[idx_1, idx_2-1] = 1.5
-    reward_bool[idx_1, idx_2-2] = 0.75
-    reward_bool[idx_1, idx_2-3] = 0.25
+    reward_bool[idx_1, idx_2-2] = 1.25
+    reward_bool[idx_1, idx_2-3] = 1.15
     
     rewards = reward_bool[:,1:]-reward_bool[:,:-1]##[B,L-1]
     batch_obs = torch.cat([batch_robot_obs,batch_scene_obs],dim=-1)
@@ -168,6 +171,7 @@ for epoch in range(epochs):
       critic_1_loss, critic_2_loss, policy_loss, ent_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_goals,updates,True)
     else:
       critic_1_loss, critic_2_loss, policy_loss, ent_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_goals,updates,False)
+
     writer.add_scalar('loss/critic_1', critic_1_loss, updates)
     writer.add_scalar('loss/critic_2', critic_2_loss, updates)
     writer.add_scalar('loss/policy', policy_loss, updates)
@@ -178,5 +182,6 @@ for epoch in range(epochs):
 
     if(updates % 10 == 0):
       print(f"Epoch{epoch} - critic_1_loss : {critic_1_loss}, critic_2_loss : {critic_2_loss}, policy_loss : {policy_loss}, ent_loss : {ent_loss},latent_loss : {latent_loss}alpha : {alpha}")
-
+  agent.policy_scheduler.step()
+  agent.critic_scheduler.step()
   agent.save_checkpoint(args.env_name)
