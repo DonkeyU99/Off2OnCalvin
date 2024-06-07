@@ -65,7 +65,7 @@ class GaussianPolicy(nn.Module):
     def __init__(self, num_inputs, num_actions,hidden_dim,lang_reduction_dim,reduced_lang_emb,action_space=None):
         super(GaussianPolicy, self).__init__()
 
-        self.linear1 = nn.Linear(num_inputs+lang_reduction_dim, hidden_dim)
+        self.linear1 = nn.Linear(2*num_inputs, hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
 
         self.mean_linear = nn.Linear(hidden_dim, num_actions)
@@ -85,9 +85,16 @@ class GaussianPolicy(nn.Module):
             self.action_bias = torch.FloatTensor(
                 (action_space.high + action_space.low) / 2.)
 
-    def forward(self, enc_state ,task_ids):
-        lang_vec = self.reduced_lang_emb[task_ids] 
-        pi_input = torch.cat([enc_state,lang_vec],dim=-1) ##코드를 짤 떄 이 방식으로 바로 concat 되게끔
+    def forward(self, enc_state, goal_state):
+        BL, D = enc_state.shape
+        B, D = goal_state.shape
+        goal_state = goal_state.repeat(1,BL//B).reshape(BL,D)
+
+        # lang_vec = self.reduced_lang_emb[task_ids] 
+        # pi_input = torch.cat([enc_state,lang_vec],dim=-1) ##코드를 짤 떄 이 방식으로 바로 concat 되게끔
+        pi_input = torch.cat([enc_state, goal_state - enc_state],dim=-1).float()
+        # pi_input = torch.cat([enc_state, goal_state],dim=-1)
+
         x = F.relu(self.linear1(pi_input))
         x = F.relu(self.linear2(x))
         mean = self.mean_linear(x)
@@ -96,8 +103,8 @@ class GaussianPolicy(nn.Module):
         log_std = torch.clamp(log_std, min=LOG_SIG_MIN, max=LOG_SIG_MAX)
         return mean, log_std
 
-    def sample(self, enc_state,task_ids):
-        mean, log_std = self.forward(enc_state,task_ids)
+    def sample(self, enc_state, goal_state):
+        mean, log_std = self.forward(enc_state, goal_state)
         std = log_std.exp()
         normal = Normal(mean, std)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))

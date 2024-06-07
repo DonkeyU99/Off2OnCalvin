@@ -54,15 +54,15 @@ class Off2On_SAC(object):
         self.policy_scheduler = CosineAnnealingWarmUpRestarts(self.policy_optim, T_0=8, T_mult=1, eta_max=0.00005, T_up=2, gamma=0.5)
         self.critic_scheduler = CosineAnnealingWarmUpRestarts(self.critic_optim, T_0=8, T_mult=1, eta_max=0.00005, T_up=2, gamma=0.5)
 
-    def select_action(self, enc_state,task_id,evaluate=False):
+    def select_action(self, enc_state, curr_goals, evaluate=False):
         enc_state = enc_state.to(self.device)
         #print(sstate.dtype)
         task_id = task_id.to(self.device)
 
         if evaluate is False:
-            action, _, _ = self.policy.sample(enc_state,task_id)
+            action, _, _ = self.policy.sample(enc_state, curr_goals)
         else:
-            _, _, action = self.policy.sample(enc_state,task_id)
+            _, _, action = self.policy.sample(enc_state, curr_goals)
         return action.detach().cpu().numpy()[0]
 
     def offline_update(self,observations,actions,task_ids,reward,mask,goals,updates,warm_up=True):
@@ -103,7 +103,8 @@ class Off2On_SAC(object):
         # next_actor_in = torch.cat([next_obs, next_actor_in], dim=-1).detach()
 
         with torch.no_grad():
-          next_state_action, next_state_log_pi, _ = self.policy.sample(next_obs, next_task_id)
+          next_state_action, next_state_log_pi, _ = self.policy.sample(
+              next_obs, curr_goals)
           qf1_next_target, qf2_next_target = self.critic_target(next_obs, next_state_action)
           min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
           next_q_value = reward.reshape(B*L,-1) + mask[:,:-1].reshape(B*L,-1) * self.gamma * (min_qf_next_target)
@@ -118,7 +119,7 @@ class Off2On_SAC(object):
         self.critic_optim.step()
         # clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
 
-        pi, log_pi, _ = self.policy.sample(curr_obs,curr_task_id)
+        pi, log_pi, _ = self.policy.sample(curr_obs, curr_goals)
         qf1_pi, qf2_pi = self.critic(curr_obs,pi)
         min_qf_pi = torch.min(qf1_pi, qf2_pi)
 

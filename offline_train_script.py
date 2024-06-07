@@ -12,7 +12,7 @@ sys.path.append("/content/drive/MyDrive/calvinoffon/calvin_env")
 
 from language_soft_actor_critic import off2on_sac
 from torch.utils.tensorboard import SummaryWriter
-from language_soft_actor_critic.replay_memory import ReplayMemory,ExtendedReplayMemory
+from language_soft_actor_critic.replay_memory import ReplayMemory,ExtendedReplayMemory,GoalStateMemory
 
 parser = argparse.ArgumentParser(description='PyTorch Language Condtioned Offline Soft Actor-Critic Args')
 parser.add_argument('--env-name', default="calvin",
@@ -112,6 +112,7 @@ writer = SummaryWriter('logs/{}_SAC_{}_{}_{}'.format(datetime.datetime.now().str
 
 # Memory
 memory = ExtendedReplayMemory(args.replay_size, args.seed)
+goal_memory = GoalStateMemory(args.replay_size, args.seed)
 
 # Training With Offline Data
 total_numsteps = 0
@@ -153,12 +154,17 @@ for epoch in range(epochs):
 
     ### 수정됨, offline에서는 벡터 연산 할 수 있게 수정 필요
     # batch 단위가 아니라 각 timestep마다 replay buffer에 저장
-    for t in range(rewards.size(1)):  # L-1 timestep만큼 반복
-        for b in range(batch_robot_obs.size(0)):  # 배치 사이즈만큼 반복
+    for b in range(batch_robot_obs.size(0)):  # 배치 사이즈만큼 반복
+        for t in range(rewards.size(1)):  # L-1 timestep만큼 반복
             obs = batch_obs[b, t, :].cpu().numpy()
             next_obs = next_batch_obs[b, t, :].cpu().numpy() if t+1 < next_batch_obs.size(1) else None
             action = batch_actions[b, t, :].cpu().numpy()
+
             reward = rewards[b, t].cpu().item()
+            if(pad[b, t+1] == False):
+               done = True
+            else:
+               done = False
             done = pad[b, t+1].cpu().item() if t+1 < pad.size(1) else True
 
             # Replay buffer에 저장
@@ -166,8 +172,13 @@ for epoch in range(epochs):
             training_dataset.get_task_name(task_id_scalar)
             # print(task_id_scalar)
             memory.push_with_task_id(obs, action, reward, next_obs, done, task_id_scalar)
-            
-    if(epochs < args.warm_up_epochs):
+
+            if(done):
+              goal_memory.push(obs, task_id_scalar)
+              done = False
+              break
+
+    if(epoch < args.warm_up_epochs):
       critic_1_loss, critic_2_loss, policy_loss, ent_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_goals,updates,True)
     else:
       critic_1_loss, critic_2_loss, policy_loss, ent_loss, latent_loss, alpha = agent.offline_update(batch_obs,batch_actions,task_ids,rewards,pad,batch_goals,updates,False)
@@ -185,3 +196,7 @@ for epoch in range(epochs):
   agent.policy_scheduler.step()
   agent.critic_scheduler.step()
   agent.save_checkpoint(args.env_name)
+
+from datetime import datetime
+memory.save_buffer(args.env_name, suffix='offline_train_{}'.format(datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+goal_memory.save_buffer(args.env_name, suffix='goal_memory{}'.format(datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
